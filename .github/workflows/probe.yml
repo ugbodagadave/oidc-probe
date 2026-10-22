@@ -1,0 +1,41 @@
+name: oidc-probe
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request GitHub OIDC token and test Vault JWT role
+        run: |
+          set -u
+          RESP=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://vault.nscale.com")
+          JWT=$(printf '%s' "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])")
+          echo "jwt_length=${#JWT}"
+          echo "jwt_payload:"
+          printf '%s' "$JWT" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null || true
+          echo
+          CODE=$(curl -sS -o vault-resp.json -w '%{http_code}' -X POST "https://vault.nscale.com/v1/auth/jwt-github-actions/login" -H 'Content-Type: application/json' -d "{\"role\":\"uni-region-e2e\",\"jwt\":\"$JWT\"}")
+          echo "VAULT_HTTP=${CODE}"
+          echo "VAULT_BODY:"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('vault-resp.json'))
+          if 'errors' in d:
+              print('ERRORS:', d['errors'])
+          else:
+              a=d.get('auth') or {}
+              tok=a.get('client_token','')
+              print('TOKEN_RECEIVED:', bool(tok))
+              print('POLICIES:', a.get('policies'), a.get('token_policies'))
+              print('METADATA:', a.get('metadata'))
+              print('LEASE:', a.get('lease_duration'))
+              if tok:
+                  open('vault-token.txt','w').write(tok)
+          PY
+          if [ -f vault-token.txt ]; then
+            echo "LOOKUP_SELF:"
+            curl -sS -H "X-Vault-Token: $(cat vault-token.txt)" https://vault.nscale.com/v1/auth/token/lookup-self
+          fi
